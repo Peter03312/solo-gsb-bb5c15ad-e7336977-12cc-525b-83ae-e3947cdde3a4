@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from bisect import bisect_left
+from decimal import Decimal
 
 MAX_INT64 = 2 ** 63 - 1
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
@@ -117,6 +119,118 @@ def validate_min_devices(value) -> int:
                        f"min_devices 必须是正整数，收到 {value}",
                        {"value": value})
     return value
+
+
+def validate_max_drift_ppm(value) -> float:
+    """现场时钟漂移阈值 max_drift_ppm：非负有限数（整数或浮点均可）。
+
+    布尔、字符串、null、NaN/Infinity、负数一律以 invalid_threshold 拒绝。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ApiError(400, "invalid_threshold",
+                       "max_drift_ppm 必须是非负数字（允许整数或浮点 ppm）",
+                       {"value": value})
+    f = float(value)
+    if not math.isfinite(f) or f < 0:
+        raise ApiError(400, "invalid_threshold",
+                       f"max_drift_ppm 必须是非负有限数，收到 {value}",
+                       {"value": value})
+    return f
+
+
+# ---------------------------------------------------------------- 时钟漂移审计
+
+def _round_half_up(value: Decimal, places: int) -> float:
+    """四舍五入（半数向上，与毫秒映射的取整口径一致）到指定小数位，转 float。"""
+    quant = Decimal(1).scaleb(-places)
+    return float(value.quantize(quant, rounding="ROUND_HALF_UP"))
+
+
+def compute_drift_report(anchors: list[dict], max_drift_ppm: float) -> dict:
+    """时钟漂移审计纯逻辑：把锚点按本地时间相邻配对，逐段计算 UTC/本地速率
+    与漂移 ppm，并标出漂移绝对值超过阈值的区间。
+
+    - anchors：至少含 local_ms / utc_ms 的锚点列表，调用方须保证已按本地时间
+      升序且本周期锚点的本地时间与 UTC 均严格递增（存储写入时已校验；
+      当前锚点表/版本冻结锚点都满足）；少于两个锚点无法配对 -> ApiError；
+    - 速率定义（与服务"UTC/本地速率"口径一致）：
+          utc_rate = (u1-u0) / (l1-l0)        # 每经过 1 本地毫秒，UTC 走过的毫秒数
+    - 漂移 ppm（有符号，正=设备本地时钟偏慢/UTC 走得更快，负=本地时钟偏快）：
+          drift_ppm = (utc_rate - 1) * 1e6
+                 = ((u1-u0) - (l1-l0)) * 1_000_000 / (l1-l0)
+      阈值比较按绝对值：|drift_ppm| > max_drift_ppm 才标为异常（恰好相等不算），
+      比较在 Decimal 精确分数上进行，恰在阈值边界时不会因浮点误差误判；
+    - 输出首尾锚点、本地/UTC 区间跨度、逐段速率与漂移，以及异常区间列表
+      （含异常原因 drift_exceeds_threshold 与偏快/偏慢方向）。
+    """
+    ordered = sorted(anchors, key=lambda a: a["local_ms"])
+    if len(ordered) < 2:
+        raise ApiError(
+            400, "insufficient_anchors",
+            "该周期锚点少于两个：时钟漂移审计至少需要两个锚点才能按本地时间"
+            "相邻配对计算速率与漂移",
+            {"anchor_count": len(ordered)})
+
+    threshold = Decimal(str(max_drift_ppm))
+    ppm_factor = Decimal(1_000_000)
+    segments: list[dict] = []
+    anomalies: list[dict] = []
+    max_abs = Decimal(0)
+    for i in range(len(ordered) - 1):
+        a0, a1 = ordered[i], ordered[i + 1]
+        dl = a1["local_ms"] - a0["local_ms"]
+        du = a1["utc_ms"] - a0["utc_ms"]
+        # 精确分数（Decimal 仅用于阈值判定与取整展示）
+        drift_exact = (Decimal(du) - Decimal(dl)) * ppm_factor / Decimal(dl)
+        rate_exact = Decimal(du) / Decimal(dl)
+        drift_ppm = _round_half_up(drift_exact, 3)
+        utc_rate = _round_half_up(rate_exact, 9)
+        exceeds = abs(drift_exact) > threshold
+        if abs(drift_exact) > max_abs:
+            max_abs = abs(drift_exact)
+        seg = {
+            "index": i,
+            "from_anchor": {"local_ms": a0["local_ms"], "utc_ms": a0["utc_ms"]},
+            "to_anchor": {"local_ms": a1["local_ms"], "utc_ms": a1["utc_ms"]},
+            "local_span_ms": dl,
+            "utc_span_ms": du,
+            "utc_local_rate": utc_rate,
+            "drift_ppm": drift_ppm,
+            "exceeds_threshold": exceeds,
+        }
+        segments.append(seg)
+        if exceeds:
+            if drift_exact > 0:
+                direction = "local_clock_slow"
+                reason = ("漂移为正且超过阈值：该区间 UTC 推进快于本地计时，"
+                          "设备本地时钟偏慢")
+            else:
+                direction = "local_clock_fast"
+                reason = ("漂移为负且超过阈值：该区间 UTC 推进慢于本地计时，"
+                          "设备本地时钟偏快")
+            excess = _round_half_up(abs(drift_exact) - threshold, 3)
+            anomalies.append({
+                **seg,
+                "reason": "drift_exceeds_threshold",
+                "message": reason,
+                "direction": direction,
+                "threshold_ppm": max_drift_ppm,
+                "excess_ppm": excess,
+            })
+
+    first, last = ordered[0], ordered[-1]
+    return {
+        "first_anchor": {"local_ms": first["local_ms"], "utc_ms": first["utc_ms"]},
+        "last_anchor": {"local_ms": last["local_ms"], "utc_ms": last["utc_ms"]},
+        "local_span_ms": last["local_ms"] - first["local_ms"],
+        "utc_span_ms": last["utc_ms"] - first["utc_ms"],
+        "anchor_count": len(ordered),
+        "segments": segments,
+        "anomalies": anomalies,
+        "anomaly_count": len(anomalies),
+        "max_abs_drift_ppm": _round_half_up(max_abs, 3),
+        "ok": not anomalies,
+    }
 
 
 # ---------------------------------------------------------------- 漂移映射

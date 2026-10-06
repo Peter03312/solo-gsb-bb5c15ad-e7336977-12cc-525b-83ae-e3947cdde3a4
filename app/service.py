@@ -26,11 +26,11 @@ from datetime import datetime, timezone
 from . import db
 from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
                     STATUS_UNLOCATABLE, compute_changes, compute_clips,
-                    compute_coverage, cycle_fingerprint, project_segment,
-                    require_fields, require_payload, segment_content_hash,
-                    sort_projections, validate_cycle_id, validate_fingerprint,
-                    validate_id, validate_min_devices, validate_ms,
-                    validate_note)
+                    compute_coverage, compute_drift_report, cycle_fingerprint,
+                    project_segment, require_fields, require_payload,
+                    segment_content_hash, sort_projections, validate_cycle_id,
+                    validate_fingerprint, validate_id, validate_max_drift_ppm,
+                    validate_min_devices, validate_ms, validate_note)
 from .db import SCHEMA_VERSION
 
 
@@ -950,6 +950,62 @@ def clip_segments(db_path: str, body):
     return 200, {"source": source, "version_no": version_no,
                  "start_ms": start_ms, "end_ms": end_ms,
                  "segments": clips, "segment_count": len(clips)}
+
+
+# ---------------------------------------------------------------- 现场时钟漂移审计
+
+def drift_audit(db_path: str, device_id: str, cycle_id: str, body):
+    """现场校准后的时钟漂移审计：读取设备某周期当前锚点（或指定版本冻结锚点），
+    按本地时间相邻配对，逐段计算 UTC/本地速率与漂移 ppm，标出超过阈值的区间。
+
+    - 请求体 {max_drift_ppm, version_no?}：max_drift_ppm 为非负的最大允许时钟
+      漂移 ppm（整数或浮点）；省略 version_no（或为 null）审计当前锚点，
+      指定则审计该已发布版本在本周期冻结的锚点（旧版 format_rev=1 快照缺失
+      周期归属，锚点一律按 default 周期处理）；
+    - 该周期锚点少于两个无法配对 -> 400 insufficient_anchors；
+      阈值非法（负数/非数字/NaN/Infinity）-> 400 invalid_threshold；
+      设备/周期/版本不存在 -> 404，且全部明确拒绝、不改动任何数据；
+    - 当前视图在单个读事务的一致快照上计算；历史审计只依据发布时冻结的锚点，
+      后续锚点更正、周期变更或新发布都不会改动历史结果。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["max_drift_ppm"])
+    max_drift_ppm = validate_max_drift_ppm(payload["max_drift_ppm"])
+    version_no = payload.get("version_no")
+    if version_no is not None:
+        if isinstance(version_no, bool) or not isinstance(version_no, int) \
+                or version_no < 1:
+            raise ApiError(400, "validation_error",
+                           "version_no 必须是正整数（已发布版本号），"
+                           "省略或 null 表示审计当前锚点",
+                           {"value": version_no})
+    with db.session(db_path) as conn, db.read_txn(conn):
+        _get_device(conn, device_id)
+        _get_cycle(conn, device_id, cycle_id)
+        if version_no is None:
+            anchors = _anchors_of(conn, device_id, cycle_id)
+            source = "current"
+        else:
+            v = conn.execute(
+                "SELECT version_no FROM versions WHERE version_no=?",
+                (version_no,)).fetchone()
+            if not v:
+                raise ApiError(404, "version_not_found",
+                               f"版本 {version_no} 不存在", {"version_no": version_no})
+            # 历史审计只依据发布时冻结的锚点；旧版快照（format_rev=1）
+            # cycle_id 为 NULL，周期归属按 default 处理
+            rows = conn.execute(
+                "SELECT device_id, cycle_id, local_ms, utc_ms FROM version_anchors "
+                "WHERE version_no=? AND device_id=? AND COALESCE(cycle_id, ?)=? "
+                "ORDER BY local_ms",
+                (version_no, device_id, DEFAULT_CYCLE_ID, cycle_id)).fetchall()
+            anchors = [{"local_ms": r["local_ms"], "utc_ms": r["utc_ms"]}
+                       for r in rows]
+            source = "version"
+    report = compute_drift_report(anchors, max_drift_ppm)
+    return 200, {"source": source, "version_no": version_no,
+                 "device_id": device_id, "cycle_id": cycle_id,
+                 "max_drift_ppm": max_drift_ppm, **report}
 
 
 # ---------------------------------------------------------------- 版本发布

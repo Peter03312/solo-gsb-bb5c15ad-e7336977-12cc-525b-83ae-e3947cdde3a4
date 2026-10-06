@@ -248,3 +248,43 @@ curl -s -X POST "$BASE/segments/clip" -H 'Content-Type: application/json' \
   -d '{"start_ms":2000,"end_ms":1000}' | pp
 curl -s -X POST "$BASE/segments/clip" -H 'Content-Type: application/json' \
   -d '{"start_ms":0,"end_ms":1000,"version_no":999}' | pp
+
+# ----------------------------------------------------------------------
+# 现场时钟漂移审计（drift audit）：相邻锚点配对算 UTC/本地速率与漂移 ppm
+# ----------------------------------------------------------------------
+
+echo; echo "== 漂移审计：当前锚点（设备 D1 / 周期 default / 阈值 100 ppm）=="
+echo "-- 逐段返回本地与 UTC 跨度、UTC/本地速率、有符号漂移 ppm；"
+echo "-- |漂移| 超过阈值的区间进入 anomalies（含原因与偏快/偏慢方向）；"
+echo "-- 并给出首尾锚点、总跨度与 max_abs_drift_ppm --"
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":100}' | pp
+
+echo; echo "== 漂移审计：放宽到 10000 ppm（同样数据 ok=true）=="
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":10000}' | pp
+
+echo; echo "== 漂移审计：指定已发布版本（只用发布时冻结的锚点，旧版周期归属按 default）=="
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":100,"version_no":1}' | pp
+
+echo; echo "== 非法漂移审计请求（只读，均不改数据）=="
+echo "-- 锚点少于两个 -> 400 insufficient_anchors --"
+curl -s -X POST "$BASE/devices" -H 'Content-Type: application/json' \
+  -d '{"device_id":"D3"}' >/dev/null
+curl -s -X POST "$BASE/devices/D3/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":100}' | pp
+echo "-- 阈值为负/非数字 -> 400 invalid_threshold --"
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":-5}' | pp
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":"100"}' | pp
+echo "-- 设备/周期/版本不存在 -> 404 --"
+curl -s -X POST "$BASE/devices/NOPE/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":100}' | pp
+curl -s -X POST "$BASE/devices/D1/cycles/boot-x/drift-audit" \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":100}' | pp
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":100,"version_no":999}' | pp

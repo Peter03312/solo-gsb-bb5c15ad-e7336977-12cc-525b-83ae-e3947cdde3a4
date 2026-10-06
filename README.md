@@ -9,6 +9,7 @@
 - **周期归属批量纠正（reassign，v1.3 新增）**：现场整理时发现一批声段被记到错误的设备时钟周期，可按采集编号批量把它们在**同一设备的已登记周期**之间移动；每项声明预期原周期与目标周期，任一项无效（编号不存在/同批重复/原周期不符/目标未登记/源或目标已封存/原周期等于目标周期）即**整批拒绝、不改动任何数据**；成功后起止本地毫秒、备注、创建时间与采集编号保持不变，各声段按目标周期锚点重算定位，相关周期内容指纹随之更新；已发布版本保持原快照，之后发布的版本反映新归属。
 - **覆盖审计（coverage audit，v1.4 新增）**：现场复核时判断指定 UTC 毫秒半开区间内是否**始终有足够不同设备录到声音**——只计可定位声段并与查询区间相交，同设备重叠声段只算一台，按设备集合变化切成最大半开片段（每段给出排序后的设备编号、数量与是否达标），不足门槛的相邻片段合并为连续缺口；可审计**当前时间轴**（一致快照）或**指定已发布版本**（历史审计只依据已冻结声段，后续锚点/周期变更不改动历史结果）；纯只读接口，无效输入或版本不存在明确拒绝且不改动数据。
 - **回放裁剪（playback clip，v1.5 新增）**：现场复核人员按 UTC 毫秒半开窗口裁出**可交给录音设备回放的片段**——每条与窗口相交且可定位的声段返回本地裁剪起止与映射后的 UTC 起止，本地边界取该声段本地范围内"映射 UTC 首次不小于窗口对应边界"的整数毫秒（不存在则截在声段末端），裁后起止相同的声段不返回；可查询**当前时间轴**或**指定已发布版本**（只用发布时冻结的锚点与声段，旧版快照缺失的周期归属按 default 处理）；同设备重叠声段分别返回，按 UTC 起点、设备编号、采集编号排序；纯只读接口，无效输入或版本不存在明确拒绝且不改动数据。
+- **现场时钟漂移审计（drift audit，v1.6 新增）**：现场校准后，运维人员提交**设备编号、周期编号、非负最大时钟漂移 ppm**（可选已发布版本号）；服务读取该周期**当前锚点**或**指定版本冻结锚点**（旧版快照缺失周期归属按 default 处理），按本地时间**相邻配对**，逐段计算 UTC/本地速率与（有符号）漂移 ppm，标出 `|漂移|` 超过阈值的区间，并给出**首尾锚点、本地/UTC 区间跨度、异常原因与偏快/偏慢方向**；锚点少于两个（`400 insufficient_anchors`）、阈值非法（`400 invalid_threshold`）、设备/周期/版本不存在（`404`）均明确拒绝、**不改动任何数据**；纯只读接口，封存周期同样可审计。
 
 ## 快速开始
 
@@ -150,6 +151,56 @@ python3 -m app          # 自动建库建表（默认 ./data/timeline.db），�
 }
 ```
 
+### 现场时钟漂移审计（drift audit）
+
+现场校准后，运维人员需要复核"这台设备这一轮计时（周期）的时钟漂移有多大、哪一段超差"。`POST /devices/{id}/cycles/{cycle_id}/drift-audit` 读取该周期锚点并按本地时间相邻配对计算：
+
+- **请求体**：`{"max_drift_ppm", "version_no?"}`——`max_drift_ppm` 为**非负**最大允许时钟漂移 ppm（整数或浮点，`0` 表示要求绝对无漂移）；省略 `version_no`（或为 `null`）审计**当前锚点**，指定则只使用**该版本发布时冻结的锚点**（`version_anchors`；旧版 `format_rev=1` 快照缺失周期归属，锚点一律按 `default` 周期处理）。
+- **逐段速率与漂移**：锚点按本地时间升序相邻配对 `(l0,u0)`、`(l1,u1)`，每段给出本地跨度 `local_span_ms = l1-l0`、UTC 跨度 `utc_span_ms = u1-u0`、**UTC/本地速率** `utc_local_rate = (u1-u0)/(l1-l0)`（四舍五入到 9 位小数）与**有符号漂移 ppm** `drift_ppm = (utc_local_rate - 1) * 1e6`（四舍五入到 3 位小数）：
+  - `drift_ppm > 0`：UTC 推进快于本地计时，**设备本地时钟偏慢**（`local_clock_slow`）；
+  - `drift_ppm < 0`：UTC 推进慢于本地计时，**设备本地时钟偏快**（`local_clock_fast`）。
+- **阈值判定**：按绝对值 `|drift_ppm| > max_drift_ppm` 标为异常区间（**恰好相等不算超差**）；阈值比较在精确分数（Decimal）上进行，恰在边界时不会被浮点误差误判。
+- **异常区间 `anomalies`**：只含超差段，除逐段数据外附带 `reason: "drift_exceeds_threshold"`、中文 `message`、`direction`（偏快/偏慢）、`threshold_ppm` 与超阈值幅度 `excess_ppm`。
+- **整体结论**：`first_anchor` / `last_anchor`（首尾锚点）、`local_span_ms` / `utc_span_ms`（首到尾区间跨度）、`anchor_count`、`max_abs_drift_ppm`（全段绝对值最大漂移）与 `ok`（无异常区间才为 `true`）。
+- **一致快照与只读**：当前视图在单个读事务的一致快照上计算；历史审计只依据发布时冻结的锚点，后续锚点更正、周期变更与新发布都**不会改动历史结果**；本接口不改动任何数据，**封存周期同样可审计**。
+- **错误契约**：该周期锚点少于两个 → `400 insufficient_anchors`（响应 `details.anchor_count` 给出实际数量）；阈值为负/非数字/NaN/Infinity → `400 invalid_threshold`；`version_no` 非正整数 → `400 validation_error`；设备不存在 → `404 device_not_found`；周期不存在 → `404 cycle_not_found`；版本不存在 → `404 version_not_found`。
+
+响应示例（三个锚点配两段，一段偏慢、一段偏快，阈值 100 ppm；节选）：
+
+```json
+{
+  "source": "current", "version_no": null,
+  "device_id": "D1", "cycle_id": "default", "max_drift_ppm": 100.0,
+  "first_anchor": {"local_ms": 1000, "utc_ms": 1700000000000},
+  "last_anchor":  {"local_ms": 121000, "utc_ms": 1700000120000},
+  "local_span_ms": 120000, "utc_span_ms": 120000, "anchor_count": 3,
+  "max_abs_drift_ppm": 8333.333, "ok": false,
+  "segments": [
+    {"index": 0,
+     "from_anchor": {"local_ms": 1000, "utc_ms": 1700000000000},
+     "to_anchor":   {"local_ms": 61000, "utc_ms": 1700000060500},
+     "local_span_ms": 60000, "utc_span_ms": 60500,
+     "utc_local_rate": 1.008333333, "drift_ppm": 8333.333,
+     "exceeds_threshold": true},
+    {"index": 1,
+     "from_anchor": {"local_ms": 61000, "utc_ms": 1700000060500},
+     "to_anchor":   {"local_ms": 121000, "utc_ms": 1700000120000},
+     "local_span_ms": 60000, "utc_span_ms": 59500,
+     "utc_local_rate": 0.991666667, "drift_ppm": -8333.333,
+     "exceeds_threshold": true}
+  ],
+  "anomalies": [
+    {"index": 0, "local_span_ms": 60000, "utc_span_ms": 60500,
+     "utc_local_rate": 1.008333333, "drift_ppm": 8333.333,
+     "exceeds_threshold": true, "reason": "drift_exceeds_threshold",
+     "message": "漂移为正且超过阈值：该区间 UTC 推进快于本地计时，设备本地时钟偏慢",
+     "direction": "local_clock_slow",
+     "threshold_ppm": 100.0, "excess_ppm": 8233.333}
+  ],
+  "anomaly_count": 2
+}
+```
+
 ### 线性漂移映射
 
 每台设备、**每个时钟周期**的锚点按本地时间排序后，在相邻锚点 `(l0,u0)`、`(l1,u1)` 间线性映射：
@@ -190,6 +241,9 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | 覆盖审计：版本不存在 | `404 version_not_found` |
 | 回放裁剪：起点不小于终点 | `400 invalid_range` |
 | 回放裁剪：版本不存在 | `404 version_not_found` |
+| 漂移审计：锚点少于两个 | `400 insufficient_anchors` |
+| 漂移审计：阈值为负/非数字/NaN/Infinity | `400 invalid_threshold` |
+| 漂移审计：设备/周期/版本不存在 | `404 device_not_found` / `404 cycle_not_found` / `404 version_not_found` |
 
 ### 幂等与冲突
 
@@ -235,6 +289,7 @@ utc(t) = u0 + (t - l0) * (u1 - u0) / (l1 - l0)     # 结果四舍五入到毫秒
 | GET | `/timeline/current` | 当前时间轴（按现有锚点实时重算，显示周期归属） |
 | POST | `/coverage/audit` | **覆盖审计** `{start_ms, end_ms, min_devices, version_no?}`（只读，省略版本号=当前时间轴） |
 | POST | `/segments/clip` | **回放裁剪** `{start_ms, end_ms, version_no?}`（只读，省略版本号=当前时间轴） |
+| POST | `/devices/{id}/cycles/{cycle_id}/drift-audit` | **现场时钟漂移审计** `{max_drift_ppm, version_no?}`（只读，相邻锚点配对算速率/漂移，标出超阈值区间） |
 | POST | `/versions` | 发布新版本（可选 `{"note": "..."}`），冻结各周期锚点与投影 |
 | GET | `/versions` / `/versions/{n}` | 版本列表 / 版本完整快照与差异（旧版本无周期字段） |
 
@@ -462,6 +517,73 @@ curl -s -X POST $BASE/segments/clip -H 'Content-Type: application/json' \
   -d '{"start_ms":0,"end_ms":1000,"version_no":999}'
 ```
 
+### 现场时钟漂移审计（现场校准后复核时钟漂移）
+
+```bash
+BASE=http://localhost:8000
+
+# 前置：设备 D1 的 default 周期已录入现场校准锚点
+#   (local=1000,  utc=1700000000000)
+#   (local=61000, utc=1700000060500)  -> UTC/本地速率 1.008333333，漂移 +8333.333 ppm
+
+# 1. 审计当前锚点：提交设备编号、周期编号、非负最大时钟漂移 ppm
+#    返回首尾锚点、本地/UTC 区间跨度、逐段速率与漂移 ppm，
+#    |漂移| 超过阈值的区间进入 anomalies（含 reason 与偏快/偏慢方向）
+curl -s -X POST $BASE/devices/D1/cycles/default/drift-audit \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":100}'
+# => {"source":"current","version_no":null,"device_id":"D1","cycle_id":"default",
+#     "first_anchor":{"local_ms":1000,"utc_ms":1700000000000},
+#     "last_anchor":{"local_ms":61000,"utc_ms":1700000060500},
+#     "local_span_ms":60000,"utc_span_ms":60500,"anchor_count":2,
+#     "segments":[{"index":0,"local_span_ms":60000,"utc_span_ms":60500,
+#                  "utc_local_rate":1.008333333,"drift_ppm":8333.333,
+#                  "exceeds_threshold":true}],
+#     "anomalies":[{"index":0,...,"reason":"drift_exceeds_threshold",
+#                   "direction":"local_clock_slow","excess_ppm":8233.333}],
+#     "anomaly_count":1,"max_abs_drift_ppm":8333.333,"ok":false}
+
+# 2. 阈值支持非负整数或浮点；恰好等于阈值不算超差（按精确分数比较）
+curl -s -X POST $BASE/devices/D1/cycles/default/drift-audit \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":10000}'
+# => "ok": true, "anomalies": []
+
+# 3. 可选已发布版本号：只审计该版本冻结的锚点
+#    （旧版 format_rev=1 快照缺失周期归属，锚点按 default 处理）
+curl -s -X POST $BASE/devices/D1/cycles/default/drift-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":100,"version_no":1}'
+
+# 4. 其他周期独立审计（设备重启轮次）
+curl -s -X POST $BASE/devices/D1/cycles/boot-2/drift-audit \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":50.5}'
+
+# 5. 明确错误（只读，均不改动数据）：
+curl -s -X POST $BASE/devices -H 'Content-Type: application/json' -d '{"device_id":"D2"}' >/dev/null
+curl -s -X POST $BASE/devices/D2/cycles/default/drift-audit \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":100}'
+#    D2/default 锚点少于两个 -> 400 insufficient_anchors（details.anchor_count 为实际数量）
+curl -s -X POST $BASE/devices/D1/cycles/default/drift-audit \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":-5}'
+#    阈值非法 -> 400 invalid_threshold（非数字/NaN/Infinity 同样拒绝）
+curl -s -X POST $BASE/devices/NOPE/cycles/default/drift-audit \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":100}'
+#    设备不存在 -> 404 device_not_found
+curl -s -X POST $BASE/devices/D1/cycles/boot-x/drift-audit \
+  -H 'Content-Type: application/json' -d '{"max_drift_ppm":100}'
+#    周期不存在 -> 404 cycle_not_found
+curl -s -X POST $BASE/devices/D1/cycles/default/drift-audit \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":100,"version_no":999}'
+#    版本不存在 -> 404 version_not_found
+```
+
+最小可运行复现（自动建设备/锚点并验证逐段速率/漂移、超阈值标记、历史版本冻结
+与各类明确错误）：
+
+```bash
+python3 examples/drift_example.py http://localhost:8000
+```
+
 报告窗口 `[1700000004000,1700000019000)` 的最小可运行复现（自动建设备/锚点/声段并
 验证相交返回、无相交/不可定位不返回、非法窗口拒绝）：
 
@@ -533,8 +655,9 @@ python3 -m unittest discover -s tests -v
 - `tests/test_reassign.py`（18 个）：批量纠正成功与字段保持、跨设备批次、互换周期、目标覆盖不足仍不可定位、时间轴/列表/计数同步、相关周期指纹更新而无关周期不变、纠正后重传幂等/冲突规则、编号不存在/同批重复/原周期不符/目标未登记（含跨设备同名）/源或目标已封存/原周期等于目标周期的整批拒绝且不改动数据、已发布版本不变而新版反映新归属、以及**纠正+锚点更正+发布并发**下快照自洽；
 - `tests/test_coverage.py`（15 个）：覆盖审计的片段切分与达标判定、同设备重叠只算一台、边界相接不重叠、零长度声段不贡献、不可定位声段不计、无数据整段为缺口、相邻缺口合并、查询区间裁剪、int64 边界、**历史版本审计冻结**（后续锚点更正/声段增删/周期纠正/新发布均不改历史结果）、非法输入与版本不存在拒绝且数据不变、审计只读、以及**审计与更正/发布并发**下每次响应都是一致快照；
 - `tests/test_clip.py`（18 个）：回放裁剪的窗口相交判定与本地边界"首次不小于"规则（含线性漂移取整与取整平台）、截在声段末端、裁后退化不返回（零长度/边界相接/陡峭漂移）、不可定位声段不返回、同设备重叠分别返回、排序规则、周期感知（只用所属周期锚点）、**历史版本裁剪冻结**（冻结锚点+声段，后续变更不改历史结果）、**旧版（format_rev=1）快照周期归属按 default**、int64 边界、非法输入与版本不存在拒绝且数据不变、裁剪只读、以及**裁剪与更正/发布并发**下每次响应都是一致快照。
+- `tests/test_drift.py`（24 个）：漂移审计的相邻配对速率/漂移（有符号，含偏快/偏慢方向）计算、首尾锚点与本地/UTC 跨度、恰好等于阈值不算超差（精确分数比较，含浮点阈值边界）、低于阈值不标异常、混合段只标超差段与全段最大绝对漂移、周期独立（只用指定周期锚点）、封存周期可审计、**历史版本审计冻结**（后续锚点更正/新发布不改历史结果）、**旧版（format_rev=1）冻结锚点周期归属按 default**（新周期旧版本无冻结锚点仍报锚点不足）、锚点不足/阈值非法（含 NaN/Infinity）/设备/周期/版本不存在明确拒绝且数据不变、审计只读、int64 锚点、纯逻辑（乱序排序/精确边界/锚点不足）以及**审计与更正/发布并发**下每次响应都是一致快照。
 
-## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3 → v1.4 → v1.5）
+## 升级与数据迁移（v1.0 → v1.1 → v1.2 → v1.3 → v1.4 → v1.5 → v1.6）
 
 - 沿用原启动方式（`python3 -m app` / Docker / Compose），服务启动时自动识别并在线迁移旧库，无需手工操作；
 - 旧设备自动补登 `default` 周期；旧锚点与声段一律归入 `default`；旧声段内容指纹按含周期的新口径重算（默认周期同内容重传仍为幂等）；
@@ -544,6 +667,7 @@ python3 -m unittest discover -s tests -v
 - v1.3 新增 `POST /segments/reassign-cycle` 批量纠正端点，**无表结构变更**，旧库直接可用；
 - v1.4 新增 `POST /coverage/audit` 覆盖审计端点（只读），**无表结构变更**，旧库直接可用；历史版本审计基于既有 `version_segments` 冻结投影，旧版本（含 `format_rev=1`）同样可审计。
 - v1.5 新增 `POST /segments/clip` 回放裁剪端点（只读），**无表结构变更**，旧库直接可用；历史版本裁剪基于既有 `version_anchors` / `version_segments` 冻结快照，旧版本（含 `format_rev=1`，周期归属按 default 处理）同样可裁剪。
+- v1.6 新增 `POST /devices/{id}/cycles/{cycle_id}/drift-audit` 现场时钟漂移审计端点（只读），**无表结构变更**，旧库直接可用；历史版本审计基于既有 `version_anchors` 冻结锚点，旧版本（含 `format_rev=1`，周期归属按 default 处理）同样可审计。
 
 ## 项目结构
 
@@ -552,7 +676,7 @@ app/
   __main__.py   # 入口：初始化数据库 + 启动 HTTP 服务
   server.py     # HTTP 路由、JSON 编解码、错误响应（http.server）
   service.py    # 服务层：各 API 操作（单事务校验+写入）
-  logic.py      # 纯逻辑：校验、线性漂移映射、排序、版本差异、周期内容指纹
+  logic.py      # 纯逻辑：校验、线性漂移映射、漂移审计、排序、版本差异、周期内容指纹
   db.py         # SQLite 连接、建表、旧库迁移（v1 整表迁移 + 封存列补齐）、事务助手（WAL）
 tests/test_api.py      # 端到端测试（原有能力，保持兼容）
 tests/test_cycles.py   # 端到端测试（时钟周期 + 旧库迁移/旧版本不变）
@@ -561,8 +685,10 @@ tests/test_reassign.py # 端到端测试（周期归属批量纠正 + 并发一�
 tests/test_coverage.py # 端到端测试（覆盖审计 + 历史冻结 + 并发一致性）
 tests/test_clip.py     # 端到端测试（回放裁剪 + 历史冻结 + 旧版快照 + 并发一致性）
 tests/test_clip_regression.py # 回归测试（报告窗口当前时间轴裁剪 + 排除/拒绝规则）
-examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正、覆盖审计与回放裁剪用法）
-examples/client.py     # Python 客户端示例（含周期、封存、批量纠正、覆盖审计与回放裁剪用法）
+tests/test_drift.py    # 端到端测试（现场时钟漂移审计 + 历史冻结 + 旧版快照 + 并发一致性）
+examples/demo.sh       # curl 调用示例（含周期、封存、批量纠正、覆盖审计、回放裁剪与漂移审计）
+examples/client.py     # Python 客户端示例（含漂移审计等全部 v1.6 能力）
 examples/clip_example.py # 回放裁剪报告窗口最小复现示例
+examples/drift_example.py # 现场时钟漂移审计最小复现示例
 Dockerfile / docker-compose.yml
 ```

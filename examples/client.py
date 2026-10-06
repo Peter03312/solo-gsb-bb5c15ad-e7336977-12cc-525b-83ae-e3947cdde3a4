@@ -128,6 +128,21 @@ class TimelineClient:
             payload["version_no"] = version_no
         return self._call("POST", "/segments/clip", payload)
 
+    # 现场时钟漂移审计
+    def drift_audit(self, device_id: str, max_drift_ppm: float,
+                    cycle_id: str = "default", version_no: int | None = None):
+        """现场时钟漂移审计：读取设备某周期当前锚点（或 version_no 指定版本
+        冻结的锚点，旧版快照缺失周期归属时按 default 处理），按本地时间
+        相邻配对，逐段给出 UTC/本地速率与漂移 ppm，并标出 |漂移| 超过
+        max_drift_ppm（非负）的区间（首尾锚点、区间跨度与异常原因）。
+        锚点少于两个 -> 400 insufficient_anchors。"""
+        payload = {"max_drift_ppm": max_drift_ppm}
+        if version_no is not None:
+            payload["version_no"] = version_no
+        return self._call(
+            "POST", f"/devices/{device_id}/cycles/{cycle_id}/drift-audit",
+            payload)
+
 
 def show(title: str, status: int, body: dict) -> None:
     print(f"\n=== {title} (HTTP {status}) ===")
@@ -281,6 +296,26 @@ def main() -> None:
          *cli.clip_segments(2000, 1000))
     show("版本不存在（404 version_not_found）",
          *cli.clip_segments(0, 1000, version_no=999))
+
+    # 14. 现场时钟漂移审计：相邻锚点配对算 UTC/本地速率与漂移 ppm，
+    #     标出 |漂移| 超过阈值的区间，给出首尾锚点、区间跨度与异常原因
+    #     D1/default 在演示中为单段 +8333.333 ppm（第 6 步更正后速率不变；
+    #     封存周期只读审计同样可用）
+    show("漂移审计：当前锚点（阈值 100 ppm，应报异常区间）",
+         *cli.drift_audit("D1", 100))
+    show("漂移审计：放宽到 10000 ppm（ok=true）",
+         *cli.drift_audit("D1", 10000))
+    #     指定 version_no 只审计发布时冻结的锚点，后续更正不影响历史结果；
+    #     旧版（format_rev=1）快照缺失周期归属时按 default 处理
+    show("漂移审计：历史版本 v1（冻结锚点）",
+         *cli.drift_audit("D1", 100, version_no=1))
+    #     无效输入：锚点少于两个 / 阈值非法 / 设备、周期、版本不存在 -> 拒绝
+    show("阈值为负（400 invalid_threshold）",
+         *cli.drift_audit("D1", -5))
+    show("版本不存在（404 version_not_found）",
+         *cli.drift_audit("D1", 100, version_no=999))
+    show("周期不存在（404 cycle_not_found）",
+         *cli.drift_audit("D1", 100, cycle_id="boot-x"))
 
 
 if __name__ == "__main__":
