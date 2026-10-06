@@ -26,11 +26,12 @@ from datetime import datetime, timezone
 from . import db
 from .logic import (ApiError, DEFAULT_CYCLE_ID, STATUS_LOCATED,
                     STATUS_UNLOCATABLE, compute_changes, compute_clips,
-                    compute_coverage, cycle_fingerprint, project_segment,
+                    compute_coverage, compute_drift_intervals,
+                    cycle_fingerprint, project_segment,
                     require_fields, require_payload, segment_content_hash,
                     sort_projections, validate_cycle_id, validate_fingerprint,
-                    validate_id, validate_min_devices, validate_ms,
-                    validate_note)
+                    validate_id, validate_max_drift_ppm, validate_min_devices,
+                    validate_ms, validate_note)
 from .db import SCHEMA_VERSION
 
 
@@ -950,6 +951,72 @@ def clip_segments(db_path: str, body):
     return 200, {"source": source, "version_no": version_no,
                  "start_ms": start_ms, "end_ms": end_ms,
                  "segments": clips, "segment_count": len(clips)}
+
+
+# ---------------------------------------------------------------- 现场校准漂移分析
+
+def drift_audit(db_path: str, device_id: str, cycle_id: str, body):
+    """现场校准漂移分析：按本地时间相邻配对锚点，逐段计算 UTC/本地速率与漂移。
+
+    - 请求体 {max_drift_ppm, version_no?}：max_drift_ppm 为允许的最大绝对
+      时钟漂移（ppm，非负有限数值）；省略 version_no（或为 null）分析
+      当前锚点，指定则分析该版本发布时冻结的锚点（旧版 format_rev=1
+      快照缺失周期归属时按 default 处理）；
+    - 逐段返回首尾锚点、本地/UTC 跨度、速率（UTC 毫秒 / 本地毫秒）、漂移
+      ppm（正=本地钟偏慢，负=偏快），|漂移| 严格超过阈值的区间给出异常原因；
+      同时给出首末锚点与整体跨度/总漂移，以及全部异常区间列表；
+    - 校验：设备不存在 -> 404 device_not_found；周期当前未登记 ->
+      404 cycle_not_found；版本不存在 -> 404 version_not_found；
+      阈值非法（负数/非数值/NaN/无穷大）-> 400 invalid_threshold；
+      锚点少于 2 个 -> 409 insufficient_anchors（冻结快照中该周期无锚点
+      亦同）；任何情况下都不改动数据（只读，单读事务一致快照）。
+    """
+    payload = require_payload(body)
+    require_fields(payload, ["max_drift_ppm"])
+    max_drift_ppm = validate_max_drift_ppm(payload["max_drift_ppm"])  # Fraction，精确判定
+    version_no = payload.get("version_no")
+    if version_no is not None:
+        if isinstance(version_no, bool) or not isinstance(version_no, int) \
+                or version_no < 1:
+            raise ApiError(400, "validation_error",
+                           "version_no 必须是正整数（已发布版本号），"
+                           "省略或 null 表示分析当前锚点",
+                           {"value": version_no})
+    with db.session(db_path) as conn, db.read_txn(conn):
+        if version_no is None:
+            _get_device(conn, device_id)
+            _get_cycle(conn, device_id, cycle_id)
+            anchors_map = _anchors_map(conn)
+            source = "current"
+        else:
+            v = conn.execute(
+                "SELECT version_no FROM versions WHERE version_no=?",
+                (version_no,)).fetchone()
+            if not v:
+                raise ApiError(404, "version_not_found",
+                               f"版本 {version_no} 不存在", {"version_no": version_no})
+            _get_device(conn, device_id)
+            _get_cycle(conn, device_id, cycle_id)
+            # 只使用发布时冻结的锚点；旧版快照（format_rev=1）cycle_id 为
+            # NULL，_anchors_map 已统一按 default 归属
+            anchors_map = _anchors_map(conn, version_no)
+            source = "version"
+        locals_list, utcs_list = anchors_map.get((device_id, cycle_id), ([], []))
+        if len(locals_list) < 2:
+            scope = f"版本 {version_no} 冻结快照中" if version_no is not None else "当前"
+            raise ApiError(409, "insufficient_anchors",
+                           f"设备 {device_id} 周期 {cycle_id} {scope}仅有 "
+                           f"{len(locals_list)} 个锚点，至少需要 2 个锚点"
+                           f"才能按本地时间相邻配对计算漂移速率",
+                           {"device_id": device_id, "cycle_id": cycle_id,
+                            "version_no": version_no,
+                            "anchor_count": len(locals_list)})
+        anchors = [{"local_ms": l, "utc_ms": u}
+                   for l, u in zip(locals_list, utcs_list)]
+    result = compute_drift_intervals(anchors, max_drift_ppm)
+    return 200, {"source": source, "version_no": version_no,
+                 "device_id": device_id, "cycle_id": cycle_id,
+                 "max_drift_ppm": float(max_drift_ppm), **result}
 
 
 # ---------------------------------------------------------------- 版本发布

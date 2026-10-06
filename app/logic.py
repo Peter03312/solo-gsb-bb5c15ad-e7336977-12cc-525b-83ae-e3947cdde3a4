@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from bisect import bisect_left
+from fractions import Fraction
 
 MAX_INT64 = 2 ** 63 - 1
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
@@ -117,6 +119,28 @@ def validate_min_devices(value) -> int:
                        f"min_devices 必须是正整数，收到 {value}",
                        {"value": value})
     return value
+
+
+def validate_max_drift_ppm(value) -> Fraction:
+    """现场校准漂移门槛 max_drift_ppm：非负有限数值（int/float，布尔拒绝）。
+
+    返回精确 Fraction（阈值判定走精确分数，避免浮点在边界上误判）。
+    NaN / 无穷大、字符串、布尔、负数一律视为非法阈值 -> 400 invalid_threshold。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ApiError(400, "invalid_threshold",
+                       "max_drift_ppm 必须是非负数值（允许的最大时钟漂移 ppm）",
+                       {"value": value})
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ApiError(400, "invalid_threshold",
+                       f"max_drift_ppm 必须是非负有限数值，收到 {value!r}",
+                       {"value": value})
+    ppm = Fraction(value)
+    if ppm < 0:
+        raise ApiError(400, "invalid_threshold",
+                       f"max_drift_ppm 必须是非负数值，收到 {value!r}",
+                       {"value": value})
+    return ppm
 
 
 # ---------------------------------------------------------------- 漂移映射
@@ -434,3 +458,96 @@ def compute_clips(segments: list[dict], anchors_map: dict,
                       "utc_end_ms": utc_end})
     clips.sort(key=lambda c: (c["utc_start_ms"], c["device_id"], c["capture_id"]))
     return clips
+
+
+# ---------------------------------------------------------------- 现场校准漂移分析
+
+# 漂移方向（以本地时钟相对 UTC 的快慢命名；drift_ppm=(UTC跨度-本地跨度)/本地跨度*1e6）
+DRIFT_RUNS_SLOW = "local_clock_runs_slow"  # drift_ppm > 0：UTC 走得比本地多，本地钟偏慢
+DRIFT_RUNS_FAST = "local_clock_runs_fast"  # drift_ppm < 0：UTC 走得比本地少，本地钟偏快
+
+
+def compute_drift_intervals(anchors: list[dict], max_drift_ppm: Fraction) -> dict:
+    """现场校准漂移分析纯逻辑：按本地时间相邻配对锚点，逐段计算速率与漂移。
+
+    - anchors：同一 (设备, 周期) 的锚点列表，每项含 local_ms / utc_ms，
+      调用方保证已按 local_ms 升序且 local_ms、utc_ms 各自严格递增
+      （当前锚点表由写入校验保证；冻结锚点在发布时同样来自校验通过的数据）；
+    - max_drift_ppm：允许的最大绝对时钟漂移（ppm，非负精确分数），
+      某段 |drift_ppm| 超过该阈值（严格大于）即标记为异常区间；
+    - 速率 rate = UTC 跨度 / 本地跨度（每 1ms 本地时间对应的 UTC 毫秒数）；
+      drift_ppm = (UTC跨度 - 本地跨度) / 本地跨度 * 1_000_000
+      —— 正值表示本地钟相对 UTC 偏慢、负值表示偏快；
+    - 阈值判定走 Fraction 精确比较（展示用 ppm/速率仍为四舍五入后的浮点）；
+    - 返回 anchor_count、逐段 intervals（含首尾锚点、双跨度、速率、漂移与
+      异常原因）、overall（首末锚点、总跨度与整段总漂移）以及异常区间列表；
+    - 不足两个锚点无法配对：抛 409 insufficient_anchors（调用方也会先拦截）。
+    """
+    n = len(anchors)
+    if n < 2:
+        raise ApiError(409, "insufficient_anchors",
+                       f"该设备周期当前仅有 {n} 个锚点，至少需要 2 个锚点"
+                       f"才能按本地时间相邻配对计算漂移速率",
+                       {"anchor_count": n})
+
+    limit_float = float(max_drift_ppm)
+    intervals = []
+    for i in range(n - 1):
+        a0, a1 = anchors[i], anchors[i + 1]
+        local_span = a1["local_ms"] - a0["local_ms"]
+        utc_span = a1["utc_ms"] - a0["utc_ms"]
+        rate = utc_span / local_span
+        exact_ppm = Fraction(utc_span - local_span, local_span) * 1_000_000
+        drift_ppm = round(float(exact_ppm), 6)
+        exceeds = abs(exact_ppm) > max_drift_ppm
+        reason = None
+        if exceeds:
+            if exact_ppm > 0:
+                direction = DRIFT_RUNS_SLOW
+                excess_ppm = round(float(exact_ppm - max_drift_ppm), 6)
+                message = (
+                    f"区间本地时钟偏慢：漂移 +{drift_ppm:g} ppm，"
+                    f"超过允许的最大漂移 {limit_float:g} ppm"
+                    f"（本地经过 {local_span}ms，UTC 经过 {utc_span}ms）")
+            else:
+                direction = DRIFT_RUNS_FAST
+                excess_ppm = round(float(-exact_ppm - max_drift_ppm), 6)
+                message = (
+                    f"区间本地时钟偏快：漂移 {drift_ppm:g} ppm，"
+                    f"其绝对值超过允许的最大漂移 {limit_float:g} ppm"
+                    f"（本地经过 {local_span}ms，UTC 经过 {utc_span}ms）")
+            reason = {"code": "drift_exceeds_threshold",
+                      "direction": direction,
+                      "message": message,
+                      "limit_ppm": limit_float,
+                      "excess_ppm": excess_ppm}
+        intervals.append({
+            "index": i,
+            "from_anchor": {"local_ms": a0["local_ms"], "utc_ms": a0["utc_ms"]},
+            "to_anchor": {"local_ms": a1["local_ms"], "utc_ms": a1["utc_ms"]},
+            "local_span_ms": local_span,
+            "utc_span_ms": utc_span,
+            "utc_rate_per_local": round(rate, 9),
+            "drift_ppm": drift_ppm,
+            "exceeds_threshold": exceeds,
+            "reason": reason,
+        })
+
+    first, last = anchors[0], anchors[-1]
+    total_local = last["local_ms"] - first["local_ms"]
+    total_utc = last["utc_ms"] - first["utc_ms"]
+    total_exact_ppm = Fraction(total_utc - total_local, total_local) * 1_000_000
+    overall = {
+        "first_anchor": {"local_ms": first["local_ms"], "utc_ms": first["utc_ms"]},
+        "last_anchor": {"local_ms": last["local_ms"], "utc_ms": last["utc_ms"]},
+        "local_span_ms": total_local,
+        "utc_span_ms": total_utc,
+        "utc_rate_per_local": round(total_utc / total_local, 9),
+        "drift_ppm": round(float(total_exact_ppm), 6),
+        "exceeds_threshold": abs(total_exact_ppm) > max_drift_ppm,
+    }
+    abnormal = [iv for iv in intervals if iv["exceeds_threshold"]]
+    return {"anchor_count": n, "interval_count": n - 1,
+            "intervals": intervals, "overall": overall,
+            "abnormal_intervals": abnormal, "abnormal_count": len(abnormal),
+            "ok": not abnormal}

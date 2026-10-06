@@ -59,6 +59,8 @@ def h_root(ctx, body, query):
             "POST   /segments                                      # body 可带 cycle_id，省略=default",
             "POST   /segments/reassign-cycle           # 批量纠正声段周期归属（整批原子）",
             "POST   /segments/clip                     # 回放裁剪：按 UTC 半开窗口裁出可回放片段",
+            "POST   /devices/{device_id}/cycles/{cycle_id}/drift-audit "
+            "# 现场校准漂移分析：相邻锚点配对算速率/漂移并标出超阈值区间",
             "GET    /segments                                      # 可加 ?device_id=&cycle_id=",
             "GET    /segments/{capture_id}",
             "DELETE /segments/{capture_id}",
@@ -159,6 +161,12 @@ def h_clip_segments(ctx, body, query):
     return service.clip_segments(ctx.db_path, body)
 
 
+def h_drift_audit(ctx, body, query, device_id, cycle_id):
+    return service.drift_audit(
+        ctx.db_path, validate_id(device_id, "device_id"),
+        validate_id(cycle_id, "cycle_id"), body)
+
+
 def h_publish(ctx, body, query):
     return service.publish_version(ctx.db_path, body)
 
@@ -184,6 +192,7 @@ ROUTES = [
     ("GET", r"^/devices/(?P<device_id>[^/]+)/cycles$", h_list_cycles),
     ("GET", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)$", h_get_cycle),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/seal$", h_seal_cycle),
+    ("POST", r"^/devices/(?P<device_id>[^/]+)/cycles/(?P<cycle_id>[^/]+)/drift-audit$", h_drift_audit),
     ("POST", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_add_anchor),
     ("GET", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_list_anchors),
     ("PUT", r"^/devices/(?P<device_id>[^/]+)/anchors$", h_replace_anchors),

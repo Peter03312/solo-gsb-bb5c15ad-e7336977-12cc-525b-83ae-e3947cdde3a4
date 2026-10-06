@@ -248,3 +248,43 @@ curl -s -X POST "$BASE/segments/clip" -H 'Content-Type: application/json' \
   -d '{"start_ms":2000,"end_ms":1000}' | pp
 curl -s -X POST "$BASE/segments/clip" -H 'Content-Type: application/json' \
   -d '{"start_ms":0,"end_ms":1000,"version_no":999}' | pp
+
+# ----------------------------------------------------------------------
+# 现场校准漂移分析（drift audit）：相邻锚点配对算 UTC/本地速率与漂移 ppm，
+# 标出 |漂移| 超过阈值的区间，给出首末锚点、区间跨度与异常原因（只读）
+# ----------------------------------------------------------------------
+
+echo; echo "== 漂移分析：D1/default 当前锚点，阈值 5000ppm =="
+echo "-- 每段给出首尾锚点、本地/UTC 跨度、速率(UTC每本地毫秒) 与 drift_ppm；"
+echo "-- drift_ppm 正=本地钟偏慢、负=偏快；严格超过阈值的区间在 reason 给出原因；"
+echo "-- overall 给出首末锚点、总跨度与整段总漂移 --"
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":5000}' | pp
+
+echo; echo "== 漂移分析：D2/default（恒等锚点，漂移 0ppm，ok=true）=="
+curl -s -X POST "$BASE/devices/D2/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":0}' | pp
+
+echo; echo "== 漂移分析：指定已发布版本 v1（只使用发布时冻结的锚点，后续更正不影响）=="
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":5000,"version_no":1}' | pp
+
+echo; echo "== 非法漂移分析请求：阈值为负 / 锚点不足 / 设备或周期或版本不存在（均拒绝不改数据）=="
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":-5}' | pp
+curl -s -X POST "$BASE/devices/D1/cycles/boot-2/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":5000,"version_no":1}' | pp
+curl -s -X POST "$BASE/devices/NOPE/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":5000}' | pp
+curl -s -X POST "$BASE/devices/D1/cycles/no-such-cycle/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":5000}' | pp
+curl -s -X POST "$BASE/devices/D1/cycles/default/drift-audit" \
+  -H 'Content-Type: application/json' \
+  -d '{"max_drift_ppm":5000,"version_no":999}' | pp
